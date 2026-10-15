@@ -1,0 +1,60 @@
+# Builds duel-engine.exe on every push, plays random self-play duels as a test, and on a "v*" tag publishes it as
+# a release (the md-duel game downloads its engine from here).
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch sources
+        shell: bash
+        run: |
+          set -e
+          mkdir -p src-ext deps/miniz deps/sqlite
+          git clone --quiet https://github.com/edo9300/ygopro-core src-ext/ygopro-core
+          git -C src-ext/ygopro-core checkout --quiet 38d04c9feb1a26617407091380634c87262fe3f8
+          git -C src-ext/ygopro-core submodule update --init --quiet
+          curl -fsSL -o deps/json.hpp https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp
+          curl -fsSL -o miniz.zip https://github.com/richgel999/miniz/releases/download/3.0.2/miniz-3.0.2.zip
+          unzip -q -o miniz.zip -d deps/miniz
+          curl -fsSL -o sqlite.zip https://www.sqlite.org/2024/sqlite-amalgamation-3460100.zip
+          unzip -q -j -o sqlite.zip '*/sqlite3.c' '*/sqlite3.h' -d deps/sqlite
+
+      - name: Build
+        shell: bash
+        run: |
+          set -e
+          cmake -S . -B build -A x64 -DOCGCORE_DIR="$(cygpath -m "$PWD/src-ext/ygopro-core")" -DDEPS_DIR="$(cygpath -m "$PWD/deps")"
+          cmake --build build --config Release --parallel
+          ./build/Release/duel-engine.exe --version
+
+      - name: Self-play test
+        shell: bash
+        run: |
+          set -e
+          curl -fsSL -o scripts.zip https://codeload.github.com/ProjectIgnis/CardScripts/zip/refs/heads/master
+          curl -fsSL -o cards.cdb https://raw.githubusercontent.com/ProjectIgnis/BabelCDB/master/cards.cdb
+          python tests/selfplay.py build/Release/duel-engine.exe cards.cdb scripts.zip tests/decks/Snake-Eye.json tests/decks/Yubel.json 10 1
+          python tests/selfplay.py build/Release/duel-engine.exe cards.cdb scripts.zip tests/decks/Labrynth.json tests/decks/Memento.json 10 2
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          mkdir out && cp build/Release/duel-engine.exe LICENSE README.md out/
+          gh release create "$GITHUB_REF_NAME" out/duel-engine.exe out/LICENSE out/README.md --title "$GITHUB_REF_NAME" --notes "duel-engine $GITHUB_REF_NAME (source: this tag)"

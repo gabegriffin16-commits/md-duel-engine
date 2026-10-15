@@ -1,0 +1,5 @@
+build/
+out/
+*.cdb
+*.zip
+__pycache__/
