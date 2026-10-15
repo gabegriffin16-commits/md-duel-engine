@@ -46,7 +46,9 @@ def answer(pr, st):
     if t == "select_battlecmd":
         if pr["attack"] and rng.random() < 0.8 and n < 3: return {"act": "attack", "i": rng.randrange(len(pr["attack"]))}
         if pr["activate"] and rng.random() < 0.3 and n < 3: return {"act": "activate", "i": rng.randrange(len(pr["activate"]))}
-        return {"act": "main2" if pr["main2"] and rng.random() < 0.3 else "end"}
+        if not pr["end"] and not pr["main2"] and pr["attack"]:   # a forced attack: ending the battle isn't offered
+            return {"act": "attack", "i": rng.randrange(len(pr["attack"]))}
+        return {"act": "main2" if pr["main2"] and (rng.random() < 0.3 or not pr["end"]) else "end"}
     if t in ("select_effectyn", "select_yesno"): return {"yes": rng.random() < 0.7}
     if t == "select_option": return {"i": rng.randrange(len(pr["options"]))}
     if t == "announce_number": return {"i": rng.randrange(len(pr["options"]))}
@@ -118,7 +120,9 @@ for g in range(GAMES):
         elif ev in ("prompt", "retry"):
             pr = e["prompt"]; kinds["?" + pr["t"]] += 1
             if pr.get("bad"): bad.append(pr)
-            if ev == "retry": retries += 1; st["tries"] += 1
+            if ev == "retry":
+                retries += 1; st["tries"] += 1
+                if st["tries"] == 50: problems.append(f"game {g}: stuck on {pr['t']}: {json.dumps(pr)[:600]}")
             else: st["tries"] = 0; prompts += 1
             if turns > 60 or prompts > 6000:   # random players can stall; call it a draw
                 send({"cmd": "surrender", "player": pr["player"]}); continue
