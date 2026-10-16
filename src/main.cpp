@@ -19,7 +19,7 @@
 #include "messages.h"
 
 using json = nlohmann::json;
-static const char* VERSION = "0.1.0";
+static const char* VERSION = "0.2.0";
 
 // ------------------------------------------------------------------ card database (BabelCDB cards.cdb)
 struct CardRow { uint32_t alias = 0, type = 0, level = 0, attribute = 0; uint64_t race = 0; int32_t atk = 0, def = 0; std::vector<uint16_t> setcodes; };
@@ -150,11 +150,165 @@ static void log_handler(void*, const char* text, int type) {
 static void emit(const json& j) { std::cout << j.dump(-1, ' ', false, json::error_handler_t::replace) << "\n"; std::cout.flush(); }
 static void fail(const std::string& why) { emit({{"ev", "error"}, {"error", why}}); }
 
+// ------------------------------------------------------------------ board snapshots (from the core's queries)
+static const uint32_t QFLAGS = QUERY_CODE | QUERY_POSITION | QUERY_TYPE | QUERY_LEVEL | QUERY_RANK | QUERY_ATTRIBUTE |
+	QUERY_RACE | QUERY_ATTACK | QUERY_DEFENSE | QUERY_BASE_ATTACK | QUERY_BASE_DEFENSE | QUERY_EQUIP_CARD |
+	QUERY_TARGET_CARD | QUERY_OVERLAY_CARD | QUERY_COUNTERS | QUERY_OWNER | QUERY_STATUS | QUERY_IS_PUBLIC |
+	QUERY_LSCALE | QUERY_RSCALE | QUERY_LINK;
+
+template<typename T> static T rd(const uint8_t* p) { T v; std::memcpy(&v, p, sizeof(T)); return v; }
+static json loc_json(const uint8_t* p) { return {{"con", p[0]}, {"loc", p[1]}, {"seq", rd<uint32_t>(p + 2)}, {"pos", rd<uint32_t>(p + 6)}}; }
+
+// Cards in one place, in zone/list order; null for an empty zone. Reads the core's per-card records:
+// [u16 size][u32 flag][value...] repeated until QUERY_END; an empty zone is a lone u16 0.
+static json query_place(OCG_Duel h, uint8_t con, uint32_t loc) {
+	OCG_QueryInfo q{QFLAGS, con, loc, 0, 0};
+	uint32_t n = 0;
+	const uint8_t* b = (const uint8_t*)OCG_DuelQueryLocation(h, &n, &q);
+	json out = json::array();
+	size_t o = 4;   // total size first
+	while(o + 2 <= n) {
+		uint16_t sz = rd<uint16_t>(b + o); o += 2;
+		if(sz == 0) { out.push_back(nullptr); continue; }
+		json c = json::object();
+		for(;;) {
+			if(o + sz > n || sz < 4) { o = n; break; }
+			uint32_t f = rd<uint32_t>(b + o); const uint8_t* v = b + o + 4;
+			switch(f) {
+			case QUERY_CODE: c["code"] = rd<uint32_t>(v); break;
+			case QUERY_POSITION: c["pos"] = rd<uint32_t>(v); break;
+			case QUERY_TYPE: c["type"] = rd<uint32_t>(v); break;
+			case QUERY_LEVEL: c["level"] = rd<uint32_t>(v); break;
+			case QUERY_RANK: c["rank"] = rd<uint32_t>(v); break;
+			case QUERY_ATTRIBUTE: c["attribute"] = rd<uint32_t>(v); break;
+			case QUERY_RACE: c["race"] = rd<uint64_t>(v); break;
+			case QUERY_ATTACK: c["atk"] = rd<int32_t>(v); break;
+			case QUERY_DEFENSE: c["def"] = rd<int32_t>(v); break;
+			case QUERY_BASE_ATTACK: c["baseAtk"] = rd<int32_t>(v); break;
+			case QUERY_BASE_DEFENSE: c["baseDef"] = rd<int32_t>(v); break;
+			case QUERY_EQUIP_CARD: if(sz >= 4 + 10 && v[1]) c["equippedTo"] = loc_json(v); break;
+			case QUERY_TARGET_CARD: { uint32_t k = rd<uint32_t>(v); json a = json::array(); for(uint32_t i = 0; i < k; i++) a.push_back(loc_json(v + 4 + 10 * i)); if(k) c["targets"] = a; break; }
+			case QUERY_OVERLAY_CARD: { uint32_t k = rd<uint32_t>(v); json a = json::array(); for(uint32_t i = 0; i < k; i++) a.push_back(rd<uint32_t>(v + 4 + 4 * i)); if(k) c["materials"] = a; break; }
+			case QUERY_COUNTERS: { uint32_t k = rd<uint32_t>(v); json a = json::array(); for(uint32_t i = 0; i < k; i++) { uint32_t x = rd<uint32_t>(v + 4 + 4 * i); a.push_back({{"type", x & 0xffff}, {"count", x >> 16}}); } if(k) c["counters"] = a; break; }
+			case QUERY_OWNER: c["owner"] = v[0]; break;
+			case QUERY_STATUS: if(rd<uint32_t>(v) & STATUS_DISABLED) c["negated"] = true; break;   // other status bits are bookkeeping
+			case QUERY_IS_PUBLIC: c["public"] = v[0] != 0; break;
+			case QUERY_LSCALE: c["lscale"] = rd<uint32_t>(v); break;
+			case QUERY_RSCALE: c["rscale"] = rd<uint32_t>(v); break;
+			case QUERY_LINK: c["link"] = rd<uint32_t>(v); c["linkMarker"] = rd<uint32_t>(v + 4); break;
+			}
+			o += sz;
+			if(f == QUERY_END) break;
+			if(o + 2 > n) break;
+			sz = rd<uint16_t>(b + o); o += 2;
+		}
+		out.push_back(std::move(c));
+	}
+	return out;
+}
+
+// What a viewer may know about a card: everything, or (hidden) only where it is and its position.
+static json seen(const json& c, uint8_t con, uint32_t loc, int viewer) {
+	if(c.is_null() || viewer < 0 || viewer == con) return c;
+	bool pub = c.value("public", false);
+	bool faceDown = (c.value("pos", 0) & POS_FACEDOWN) != 0;
+	bool hide = (loc == LOCATION_HAND && !pub) || (loc == LOCATION_EXTRA && faceDown && !pub) ||
+		((loc & (LOCATION_MZONE | LOCATION_SZONE | LOCATION_REMOVED)) && faceDown && !pub);
+	if(!hide) return c;
+	json h = {{"hidden", true}, {"pos", c.value("pos", 0)}};
+	if(c.contains("materials")) h["materials"] = c["materials"];   // Xyz materials are public
+	if(c.contains("counters")) h["counters"] = c["counters"];
+	return h;
+}
+
 // ------------------------------------------------------------------ the duel
 struct Duel {
 	OCG_Duel h = nullptr;
 	int promptType = 0; json prompt;   // the decision the duel is waiting for (promptType 0 = none)
 	bool over = false;
+	bool split = true;                 // per-player views (online); false = one view of everything (local tests)
+	int turn = 0, turnPlayer = 0, phase = 0;
+	int64_t lp[2] = {8000, 8000};
+	json chain = json::array();        // links of the chain being built / resolved
+
+	// Keeps the duel facts that snapshots carry (the core has no query for these).
+	void track(const json& m) {
+		const std::string t = m.value("t", "");
+		if(t == "new_turn") { turn++; turnPlayer = m.value("player", 0); }
+		else if(t == "new_phase") phase = m.value("phase", 0);
+		else if(t == "lp_update") lp[m.value("player", 0) & 1] = m.value("lp", 0);
+		else if(t == "damage" || t == "pay_lpcost") lp[m.value("player", 0) & 1] -= m.value("amount", 0);
+		else if(t == "recover") lp[m.value("player", 0) & 1] += m.value("amount", 0);
+		else if(t == "chaining") chain.push_back({{"code", m["code"]}, {"at", m["at"]}, {"player", m["tcon"]}, {"desc", m["desc"]}});
+		else if(t == "chain_solving" || t == "chain_negated" || t == "chain_disabled") {
+			size_t i = (size_t)m.value("chain", 0);
+			if(i >= 1 && i <= chain.size()) chain[i - 1][t == "chain_solving" ? "resolving" : (t == "chain_negated" ? "negated" : "disabled")] = true;
+		}
+		else if(t == "chain_solved") { size_t i = (size_t)m.value("chain", 0); if(i >= 1 && i <= chain.size()) chain[i - 1]["resolved"] = true; }
+		else if(t == "chain_end") chain = json::array();
+	}
+
+	json snapshot(int viewer) {
+		json players = json::array();
+		static const std::pair<const char*, uint32_t> places[] = {{"mzone", LOCATION_MZONE}, {"szone", LOCATION_SZONE},
+			{"hand", LOCATION_HAND}, {"grave", LOCATION_GRAVE}, {"removed", LOCATION_REMOVED}, {"extra", LOCATION_EXTRA}};
+		for(uint8_t p = 0; p < 2; p++) {
+			json pl = json::object();
+			for(auto& [name, loc] : places) {
+				json cards = query_place(h, p, loc), out = json::array();
+				for(auto& c : cards) out.push_back(seen(c, p, loc, viewer));
+				pl[name] = std::move(out);
+			}
+			pl["deck"] = OCG_DuelQueryCount(h, p, LOCATION_DECK);
+			pl["lp"] = lp[p];
+			players.push_back(std::move(pl));
+		}
+		return {{"turn", turn}, {"turnPlayer", turnPlayer}, {"phase", phase}, {"players", players}, {"chain", chain}};
+	}
+
+	// Sends an event to one player (split) or to everyone (one view).
+	void to(int viewer, json ev) { if(split) ev["to"] = viewer; emit(ev); }
+	// Board state goes out before each prompt as a diff against what that viewer last got: only the top-level fields
+	// and the player places (hand, mzone, grave...) that changed. A viewer's first one, and any after "resync", is
+	// "full". Chain windows repeat a lot, so most prompts send nothing.
+	json lastState[3];
+	static json state_diff(const json& now, const json& before) {
+		if(before.is_null()) return now;
+		json d = json::object();
+		for(auto& [k, v] : now.items()) {
+			if(k == "players") {
+				json pd = json::object();
+				for(int p = 0; p < 2; p++) {
+					json one = json::object();
+					for(auto& [pk, pv] : v[p].items()) if(before[k][p][pk] != pv) one[pk] = pv;
+					if(!one.empty()) pd[std::to_string(p)] = std::move(one);
+				}
+				if(!pd.empty()) d[k] = std::move(pd);
+			} else if(before[k] != v) d[k] = v;
+		}
+		return d;
+	}
+	void send_state(int v) {   // v = -1: the one view of everything
+		json s = snapshot(v);
+		bool full = lastState[v + 1].is_null();
+		json d = state_diff(s, lastState[v + 1]);
+		lastState[v + 1] = std::move(s);
+		if(d.empty()) return;
+		json ev = {{"ev", "state"}, {"full", full}, {"state", std::move(d)}};
+		if(split) to(v, std::move(ev)); else emit(ev);
+	}
+	void send_states() {
+		if(!split) { send_state(-1); return; }
+		for(int v = 0; v < 2; v++) send_state(v);
+	}
+	void resync(int v) { lastState[v + 1] = nullptr; send_state(split ? v : -1); if(!over && promptType && prompt.value("player", -1) == v) to(v, {{"ev", "prompt"}, {"prompt", split ? msg::prompt_for_player(prompt) : prompt}}); }
+	void send_prompt(const char* ev) {
+		int p = prompt.value("player", 0);
+		send_states();
+		if(!split) { emit({{"ev", ev}, {"prompt", prompt}}); return; }
+		to(p, {{"ev", ev}, {"prompt", msg::prompt_for_player(prompt)}});
+		to(1 - p, {{"ev", "waiting"}, {"player", p}});
+	}
 
 	~Duel() { if(h) OCG_DestroyDuel(h); }
 
@@ -164,8 +318,8 @@ struct Duel {
 			for(int i = 0; i < 4; i++) o.seed[i] = req["seed"][i].get<uint64_t>();
 		else { std::random_device rd; std::mt19937_64 g(((uint64_t)rd() << 32) ^ rd()); for(auto& s : o.seed) s = g(); }
 		o.flags = DUEL_MODE_MR5;
-		uint32_t lp = req.value("lp", 8000u), hand = req.value("hand", 5u), draw = req.value("draw", 1u);
-		o.team1 = {lp, hand, draw}; o.team2 = {lp, hand, draw};
+		uint32_t startLp = req.value("lp", 8000u), hand = req.value("hand", 5u), draw = req.value("draw", 1u);
+		o.team1 = {startLp, hand, draw}; o.team2 = {startLp, hand, draw};
 		o.cardReader = card_reader; o.scriptReader = script_reader; o.logHandler = log_handler; o.cardReaderDone = card_reader_done;
 		if(OCG_CreateDuel(&h, &o) != OCG_DUEL_CREATION_SUCCESS) { h = nullptr; err = "couldn't create the duel"; return false; }
 		for(const char* f : {"constant.lua", "utility.lua"})
@@ -183,6 +337,8 @@ struct Duel {
 			for(auto& c : pl.value("extra", json::array())) add(c.get<uint32_t>(), LOCATION_EXTRA);
 		}
 		if(!unknown.empty()) emit({{"ev", "warning"}, {"warning", "cards not in the database were left out"}, {"cards", unknown}});
+		split = req.value("view", std::string("split")) != "all";
+		lp[0] = lp[1] = startLp;
 		OCG_StartDuel(h);
 		return true;
 	}
@@ -201,20 +357,22 @@ struct Duel {
 					json m = msg::decode(t, p + o + 5, ln - 1);
 					if(t == MSG_RETRY) {
 						// The last answer wasn't legal: the core asks the same question again.
-						emit({{"ev", "retry"}, {"prompt", prompt}});
 						promptType = prompt.value("type", 0);
+						send_prompt("retry");
 						return;
 					}
-					if(msg::is_prompt(t)) { promptType = t; prompt = m; prompt["type"] = t; emit({{"ev", "prompt"}, {"prompt", prompt}}); }
+					if(msg::is_prompt(t)) { promptType = t; prompt = m; prompt["type"] = t; send_prompt("prompt"); }
 					else {
-						emit({{"ev", "msg"}, {"msg", m}});
-						if(t == MSG_WIN) { over = true; emit({{"ev", "end"}, {"winner", m.value("player", 2)}, {"reason", m.value("reason", 0)}}); }
+						track(m);
+						if(!split) emit({{"ev", "msg"}, {"msg", m}});
+						else for(int v = 0; v < 2; v++) { json f = msg::for_viewer(m, v); if(!f.is_null()) to(v, {{"ev", "msg"}, {"msg", f}}); }
+						if(t == MSG_WIN) { over = true; promptType = 0; send_states(); emit({{"ev", "end"}, {"winner", m.value("player", 2)}, {"reason", m.value("reason", 0)}}); return; }
 					}
 				}
 				o += 4 + ln;
 			}
 			if(promptType) return;
-			if(st == OCG_DUEL_STATUS_END) { if(!over) { over = true; emit({{"ev", "end"}, {"winner", 2}, {"reason", -1}}); } return; }
+			if(st == OCG_DUEL_STATUS_END) { if(!over) { over = true; send_states(); emit({{"ev", "end"}, {"winner", 2}, {"reason", -1}}); } return; }
 		}
 		if(!over && !promptType) fail("duel stopped without a prompt");
 	}
@@ -224,7 +382,7 @@ struct Duel {
 		int player = req.value("player", -1);
 		if(player != prompt.value("player", -2)) { fail("not this player's decision"); return; }
 		std::string bytes, err;
-		if(!msg::encode_response(promptType, prompt, req.value("answer", json::object()), bytes, err)) { fail(err); emit({{"ev", "prompt"}, {"prompt", prompt}}); return; }
+		if(!msg::encode_response(promptType, prompt, req.value("answer", json::object()), bytes, err)) { fail(err); send_prompt("retry"); return; }
 		OCG_DuelSetResponse(h, bytes.data(), (uint32_t)bytes.size());
 		pump();
 	}
@@ -259,9 +417,12 @@ int main(int argc, char** argv) {
 		} else if(cmd == "respond") {
 			if(!duel || duel->over) { fail("no duel running"); continue; }
 			duel->respond(req);
+		} else if(cmd == "resync") {
+			if(!duel) { fail("no duel running"); continue; }
+			duel->resync(req.value("player", 0));
 		} else if(cmd == "surrender") {
 			if(!duel || duel->over) { fail("no duel running"); continue; }
-			duel->over = true;
+			duel->over = true; duel->promptType = 0;
 			int p = req.value("player", 0);
 			emit({{"ev", "end"}, {"winner", 1 - p}, {"reason", "surrender"}});
 		} else fail("unknown cmd " + cmd);

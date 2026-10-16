@@ -19,4 +19,10 @@ json decode(int type, const uint8_t* body, size_t len);
 // Builds the core's response bytes for a prompt from the client's JSON answer. Returns false (with err) when
 // the answer doesn't fit the prompt; the core also checks and asks again (MSG_RETRY) when it's illegal.
 bool encode_response(int type, const json& prompt, const json& answer, std::string& out, std::string& err);
+// What `viewer` (0 / 1) may see of a decoded info message: the message with hidden card codes set to 0, or null
+// when it isn't for them. Prompts aren't passed here (they go to their player only). Rules follow the YGOPro /
+// EDOPro servers: hands, Decks, face-down and Extra Deck cards stay hidden from the other player.
+json for_viewer(const json& m, int viewer);
+// A prompt as its player sees it: codes of the other player's face-down cards set to 0.
+json prompt_for_player(const json& p);
 }

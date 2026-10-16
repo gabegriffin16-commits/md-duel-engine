@@ -178,7 +178,19 @@ bool is_prompt(int type) { auto it = specs().find(type); return it != specs().en
 json decode(int type, const uint8_t* body, size_t len) {
 	auto it = specs().find(type);
 	json j;
-	if(it == specs().end() || !it->second.schema) {
+	if(type == MSG_SHUFFLE_SET_CARD) {
+		// loc u8, count u8, then count old places and count new places (loc_info each): one count used twice.
+		Reader r{body, len};
+		j = json::object();
+		j["loc"] = r.get<uint8_t>();
+		uint8_t k = r.get<uint8_t>();
+		for(const char* f : {"from", "to"}) {
+			json arr = json::array();
+			for(int i = 0; i < k; i++) { json l; l["con"] = r.get<uint8_t>(); l["loc"] = r.get<uint8_t>(); l["seq"] = r.get<uint32_t>(); l["pos"] = r.get<uint32_t>(); arr.push_back(l); }
+			j[f] = std::move(arr);
+		}
+		if(r.over || r.o != len) { j["raw"] = hex(body, len); j["bad"] = true; }
+	} else if(it == specs().end() || !it->second.schema) {
 		j = json::object();
 		j["raw"] = hex(body, len);
 	} else {
@@ -189,6 +201,67 @@ json decode(int type, const uint8_t* body, size_t len) {
 	}
 	j["t"] = it == specs().end() ? std::string("msg_") + std::to_string(type) : it->second.name;
 	return j;
+}
+
+namespace {
+constexpr int FACEUP = 0x5, FACEDOWN = 0xA;   // POS_FACEUP_ATTACK | POS_FACEUP_DEFENSE, and the face-down pair
+constexpr int L_DECK = 0x1, L_HAND = 0x2, L_GRAVE = 0x10, L_OVERLAY = 0x80;
+int I(const json& j, const char* k) { return j.contains(k) && j[k].is_number() ? j[k].get<int>() : 0; }
+// Would a card placed here be hidden from the player who doesn't control it?
+bool hidden_place(const json& at) {
+	int loc = I(at, "loc"), pos = I(at, "pos");
+	if(loc & (L_GRAVE | L_OVERLAY)) return false;
+	return (loc & (L_DECK | L_HAND)) || (pos & FACEDOWN);
+}
+}
+
+json for_viewer(const json& src, int v) {
+	json m = src;
+	const std::string t = m.value("t", "");
+	if(t == "hint") {
+		// 1 event, 2 message, 3 "select a card to...", 5 effect: for that player only. The rest (chosen option,
+		// declared Type / Attribute / name / number, card, zone) are public.
+		int type = I(m, "type");
+		if((type == 1 || type == 2 || type == 3 || type == 5) && I(m, "player") != v) return nullptr;
+		return m;
+	}
+	if(t == "draw") {
+		if(I(m, "player") != v) for(auto& c : m["cards"]) if(!(I(c, "pos") & FACEUP)) c["code"] = 0;
+		return m;
+	}
+	if(t == "move") {
+		if(I(m["to"], "con") != v && hidden_place(m["to"])) m["code"] = 0;
+		return m;
+	}
+	if(t == "set") { if(I(m["at"], "con") != v) m["code"] = 0; return m; }
+	if(t == "swap") {
+		if(I(m["at1"], "con") != v && hidden_place(m["at1"])) m["code1"] = 0;
+		if(I(m["at2"], "con") != v && hidden_place(m["at2"])) m["code2"] = 0;
+		return m;
+	}
+	if(t == "shuffle_hand" || t == "shuffle_extra") {
+		if(I(m, "player") != v) for(auto& c : m["cards"]) c["code"] = 0;
+		return m;
+	}
+	if(t == "confirm_cards") {
+		// Cards looked at in the Deck are for the player looking only; revealed cards are for both.
+		bool deck = !m["cards"].empty() && (I(m["cards"][0], "loc") & L_DECK);
+		if(deck && I(m, "player") != v) return nullptr;
+		return m;
+	}
+	if(t == "missed_effect") return I(m["at"], "con") == v ? m : json(nullptr);
+	if(m.contains("raw") && t != "swap_grave_deck") return nullptr;   // unknown layout: can't tell what it shows
+	return m;
+}
+
+json prompt_for_player(const json& src) {
+	json p = src;
+	int me = I(p, "player");
+	auto hide = [&](json& list) {
+		for(auto& c : list) if(c.contains("at") && I(c["at"], "con") != me && (I(c["at"], "pos") & FACEDOWN)) c["code"] = 0;
+	};
+	for(const char* k : {"cards", "select", "unselect", "must"}) if(p.contains(k) && p[k].is_array()) hide(p[k]);
+	return p;
 }
 
 // Answers (client JSON) per prompt:
