@@ -21,7 +21,7 @@
 #include "messages.h"
 
 using json = nlohmann::json;
-static const char* VERSION = "0.3.1";
+static const char* VERSION = "0.3.2";
 
 // ------------------------------------------------------------------ card database (BabelCDB cards.cdb)
 struct CardRow { uint32_t alias = 0, type = 0, level = 0, attribute = 0; uint64_t race = 0; int32_t atk = 0, def = 0; std::vector<uint16_t> setcodes;
@@ -346,6 +346,7 @@ struct Duel {
 			if(!script_reader(nullptr, h, f)) { err = std::string("missing core script ") + f; return false; }
 		if(!req.contains("players") || !req["players"].is_array() || req["players"].size() != 2) { err = "players: two decks needed"; return false; }
 		json unknown = json::array();
+		std::mt19937_64 deck_rng(o.seed[0] ^ (o.seed[1] * 0x9E3779B97F4A7C15ull) ^ o.seed[2] ^ o.seed[3]);
 		for(uint8_t p = 0; p < 2; p++) {
 			const json& pl = req["players"][p];
 			auto add = [&](uint32_t code, uint32_t loc) {
@@ -353,7 +354,12 @@ struct Duel {
 				OCG_NewCardInfo i{p, 0, code, p, loc, 0, POS_FACEDOWN_DEFENSE};
 				OCG_DuelNewCard(h, &i);
 			};
-			for(auto& c : pl.value("main", json::array())) add(c.get<uint32_t>(), LOCATION_DECK);
+			// The core doesn't shuffle the starting Deck (EDOPro's host does it before handing the cards over), so
+			// shuffle here, from the duel's seed: same seed, same order.
+			std::vector<uint32_t> main;
+			for(auto& c : pl.value("main", json::array())) main.push_back(c.get<uint32_t>());
+			std::shuffle(main.begin(), main.end(), deck_rng);
+			for(uint32_t c : main) add(c, LOCATION_DECK);
 			for(auto& c : pl.value("extra", json::array())) add(c.get<uint32_t>(), LOCATION_EXTRA);
 		}
 		if(!unknown.empty()) emit({{"ev", "warning"}, {"warning", "cards not in the database were left out"}, {"cards", unknown}});
