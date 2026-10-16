@@ -30,6 +30,9 @@ One JSON object per line each way.
   "seed":[4 x u64] (optional, random if left out), "lp":8000, "hand":5, "draw":1,
   "view":"split" (default: per-player events) | "all" (one view of everything, for local tests)}
 {"cmd":"respond","player":0|1,"answer":{...}}                            answers the waiting prompt
+{"cmd":"cards","codes":[codes]}                                        -> {"ev":"cards","cards":{"<code>":{name,desc,type,atk,def,
+                                                                          level,link,linkMarker,attribute,race,lscale,rscale,setcode,alias,strings}}}
+{"cmd":"search","text":"ash blo","limit":30}                            -> {"ev":"search","cards":[...]} (name search, for declaring a card)
 {"cmd":"resync","player":0|1}                                           -> a full state for that player (+ their prompt)
 {"cmd":"surrender","player":0|1}                                        -> {"ev":"end","winner":..,"reason":"surrender"}
 {"cmd":"quit"}

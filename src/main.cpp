@@ -2,6 +2,8 @@
 // AGPL-3.0-or-later. See README.md for the protocol.
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -19,17 +21,18 @@
 #include "messages.h"
 
 using json = nlohmann::json;
-static const char* VERSION = "0.2.0";
+static const char* VERSION = "0.3.0";
 
 // ------------------------------------------------------------------ card database (BabelCDB cards.cdb)
-struct CardRow { uint32_t alias = 0, type = 0, level = 0, attribute = 0; uint64_t race = 0; int32_t atk = 0, def = 0; std::vector<uint16_t> setcodes; };
+struct CardRow { uint32_t alias = 0, type = 0, level = 0, attribute = 0; uint64_t race = 0; int32_t atk = 0, def = 0; std::vector<uint16_t> setcodes;
+	uint64_t setcode = 0; uint32_t ot = 0; std::string name, desc; std::vector<std::string> strs; };
 static std::unordered_map<uint32_t, CardRow> g_cards;
 
 static bool load_cdb(const std::string& path, std::string& err) {
 	sqlite3* db = nullptr;
 	if(sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) { err = "can't open card database"; if(db) sqlite3_close(db); return false; }
 	sqlite3_stmt* st = nullptr;
-	if(sqlite3_prepare_v2(db, "select id,alias,setcode,type,atk,def,level,race,attribute from datas", -1, &st, nullptr) != SQLITE_OK) {
+	if(sqlite3_prepare_v2(db, "select d.id,d.alias,d.setcode,d.type,d.atk,d.def,d.level,d.race,d.attribute,d.ot,t.name,t.desc,t.str1,t.str2,t.str3,t.str4,t.str5,t.str6,t.str7,t.str8,t.str9,t.str10,t.str11,t.str12,t.str13,t.str14,t.str15,t.str16 from datas d left join texts t on t.id=d.id", -1, &st, nullptr) != SQLITE_OK) {
 		err = sqlite3_errmsg(db); sqlite3_close(db); return false;
 	}
 	while(sqlite3_step(st) == SQLITE_ROW) {
@@ -45,6 +48,12 @@ static bool load_cdb(const std::string& path, std::string& err) {
 		r.level = (uint32_t)sqlite3_column_int64(st, 6);
 		r.race = (uint64_t)sqlite3_column_int64(st, 7);
 		r.attribute = (uint32_t)sqlite3_column_int64(st, 8);
+		r.setcode = sc;
+		r.ot = (uint32_t)sqlite3_column_int64(st, 9);
+		auto txt = [&](int c) { const unsigned char* v = sqlite3_column_text(st, c); return v ? std::string((const char*)v) : std::string(); };
+		r.name = txt(10); r.desc = txt(11);
+		for(int i = 0; i < 16; i++) r.strs.push_back(txt(12 + i));
+		while(!r.strs.empty() && r.strs.back().empty()) r.strs.pop_back();
 		g_cards[id] = std::move(r);
 	}
 	sqlite3_finalize(st);
@@ -144,6 +153,17 @@ static int script_reader(void*, OCG_Duel duel, const char* name) {
 static void log_handler(void*, const char* text, int type) {
 	json j; j["ev"] = "log"; j["type"] = type; j["text"] = text ? text : "";
 	std::cout << j.dump(-1, ' ', false, json::error_handler_t::replace) << "\n";
+}
+
+static std::string lower(std::string s) { for(auto& ch : s) ch = (char)std::tolower((unsigned char)ch); return s; }
+static json card_json(uint32_t code, const CardRow& r) {
+	json j = {{"code", code}, {"name", r.name}, {"desc", r.desc}, {"type", r.type}, {"attribute", r.attribute}, {"race", r.race},
+		{"level", r.level & 0xff}, {"lscale", (r.level >> 24) & 0xff}, {"rscale", (r.level >> 16) & 0xff}, {"setcode", r.setcode}};
+	if(r.type & TYPE_LINK) { j["atk"] = r.atk; j["link"] = r.level & 0xff; j["linkMarker"] = r.def; }
+	else { j["atk"] = r.atk; j["def"] = r.def; }
+	if(r.alias) j["alias"] = r.alias;
+	if(!r.strs.empty()) j["strings"] = r.strs;
+	return j;
 }
 
 // ------------------------------------------------------------------ output
@@ -417,6 +437,32 @@ int main(int argc, char** argv) {
 		} else if(cmd == "respond") {
 			if(!duel || duel->over) { fail("no duel running"); continue; }
 			duel->respond(req);
+		} else if(cmd == "cards") {
+			// Card info for the UI from the same database the rules use: name, text, stats, effect strings.
+			json out = json::object();
+			for(auto& c : req.value("codes", json::array())) {
+				uint32_t code = c.get<uint32_t>();
+				auto it = g_cards.find(code);
+				if(it == g_cards.end()) continue;
+				out[std::to_string(code)] = card_json(code, it->second);
+			}
+			emit({{"ev", "cards"}, {"id", id}, {"cards", out}});
+		} else if(cmd == "search") {
+			// Card name search (declaring a card name): case-insensitive substring, official cards first, no tokens.
+			std::string q = lower(req.value("text", std::string()));
+			size_t limit = req.value("limit", 30u);
+			std::vector<std::pair<int, uint32_t>> hits;
+			for(auto& [code, r] : g_cards) {
+				if(r.alias || (r.type & TYPE_TOKEN) || r.name.empty()) continue;
+				std::string n = lower(r.name);
+				size_t at = n.find(q);
+				if(q.empty() || at == std::string::npos) continue;
+				hits.push_back({(at == 0 ? 0 : 1) * 1000 + (int)std::min<size_t>(n.size(), 999), code});
+			}
+			std::sort(hits.begin(), hits.end());
+			json out = json::array();
+			for(size_t i = 0; i < hits.size() && i < limit; i++) out.push_back(card_json(hits[i].second, g_cards[hits[i].second]));
+			emit({{"ev", "search"}, {"id", id}, {"cards", out}});
 		} else if(cmd == "resync") {
 			if(!duel) { fail("no duel running"); continue; }
 			duel->resync(req.value("player", 0));
