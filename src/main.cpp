@@ -21,7 +21,7 @@
 #include "messages.h"
 
 using json = nlohmann::json;
-static const char* VERSION = "0.3.0";
+static const char* VERSION = "0.3.1";
 
 // ------------------------------------------------------------------ card database (BabelCDB cards.cdb)
 struct CardRow { uint32_t alias = 0, type = 0, level = 0, attribute = 0; uint64_t race = 0; int32_t atk = 0, def = 0; std::vector<uint16_t> setcodes;
@@ -433,6 +433,7 @@ int main(int argc, char** argv) {
 			std::string err;
 			if(!duel->create(req, err)) { fail(err); duel.reset(); continue; }
 			emit({{"ev", "started"}, {"id", id}});
+			duel->send_states();   // the starting board (decks placed, empty hands) before the opening draws
 			duel->pump();
 		} else if(cmd == "respond") {
 			if(!duel || duel->over) { fail("no duel running"); continue; }
