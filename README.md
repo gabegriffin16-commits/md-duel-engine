@@ -35,10 +35,39 @@ One JSON object per line each way.
 {"cmd":"search","text":"ash blo","limit":30}                            -> {"ev":"search","cards":[...]} (name search, for declaring a card)
 {"cmd":"resync","player":0|1}                                           -> a full state for that player (+ their prompt)
 {"cmd":"surrender","player":0|1}                                        -> {"ev":"end","winner":..,"reason":"surrender"}
+{"cmd":"dev","op":...,"player":0|1,...}                                 -> {"ev":"reset"}, {"ev":"dev","ok":true}, then the
+                                                                          duel again (only in duels started with "dev":true)
 {"cmd":"quit"}
 ```
 
 Player 0 goes first.
+
+### Test layouts (local duels)
+
+`start` may carry `"dev":true` (allows `dev` commands) and `"setup"`: a layout to start from instead of shuffled
+decks and opening hands. It's built the way puzzles are (Debug.ReloadFieldBegin / AddCard / ReloadFieldEnd, with
+DUEL_ATTACK_FIRST_TURN), so a layout can start in battle on turn 1:
+
+```
+{"turn":0|1, "players":[{"lp":8000, "deck":[...], "extra":[...], "hand":[...], "grave":[...], "removed":[...],
+   "mzone":[null | {"card":"Name"|code, "seq":0-6, "pos":"atk"|"def"|"set"|POS_*, "materials":[...], "counters":[...],
+   "owner":0|1}], "szone":[... same, seq 0-4, 5 = Field Zone; "equippedTo":{"con","seq"}]}, {...}],
+ "actions":[{"do":"summon", "player", "card", "pos", "materials":[...], "how":"special"|"normal"},
+   {"do":"draw", "player", "count"}, {"do":"damage"|"recover", "player", "amount"},
+   {"do":"destroy"|"tograve"|"banish"|"tohand", "player", "card"}]}
+```
+
+Cards are codes or names (exact, else the only few names containing it; a vague name is an error listing matches).
+Decks and Extra Decks left out come from `players`. Actions run for real (messages, chains, triggers) at the start of
+the turn player's Main Phase 1; summons from the Extra Deck use their summon type (Fusion / Synchro / Xyz / Link) and
+count as properly summoned. `"turn":1` plays player 0's turn through on default answers without showing it, so the
+duel opens on player 1's turn 2. The two Extra Monster Zones are shared (player 0's 5 / 6 are player 1's 6 / 5).
+
+`dev` rebuilds the running duel from the board as it is (Deck order, LP, materials, counters, equips kept; the turn
+count and once-per-turn uses start over) with one change: `op` `spawn` (`card`, `to`: hand / mzone / emz / szone /
+field / grave / removed / deck / extra, `pos`, `seq`, `materials`), `act` (`action`: one of the actions above),
+`lp` (`value`), `remove` (`card`), `clear` (field to GY; `player` or both), `turn` (`turn`: whose turn it becomes),
+`load` (`setup`: a whole layout). A failed one answers `{"ev":"dev","ok":false,"error":...}` and changes nothing.
 
 ### Views
 

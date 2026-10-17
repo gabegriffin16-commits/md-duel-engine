@@ -21,7 +21,7 @@
 #include "messages.h"
 
 using json = nlohmann::json;
-static const char* VERSION = "0.3.2";
+static const char* VERSION = "0.4.0";
 
 // ------------------------------------------------------------------ card database (BabelCDB cards.cdb)
 struct CardRow { uint32_t alias = 0, type = 0, level = 0, attribute = 0; uint64_t race = 0; int32_t atk = 0, def = 0; std::vector<uint16_t> setcodes;
@@ -164,6 +164,193 @@ static json card_json(uint32_t code, const CardRow& r) {
 	if(r.alias) j["alias"] = r.alias;
 	if(!r.strs.empty()) j["strings"] = r.strs;
 	return j;
+}
+
+// ------------------------------------------------------------------ dev layouts (test setups, local duels only)
+// A card given as a code or a name: exact name (case-insensitive) first, else the shortest name containing it.
+static uint32_t resolve_card(const json& v, std::string& err) {
+	if(v.is_number()) { uint32_t c = v.get<uint32_t>(); if(g_cards.count(c)) return c; err = "unknown card code " + std::to_string(c); return 0; }
+	if(!v.is_string()) { err = "card missing"; return 0; }
+	std::string q = lower(v.get<std::string>());
+	uint32_t best = 0; size_t bestLen = SIZE_MAX;
+	std::vector<std::pair<size_t, std::string>> near;
+	for(auto& [code, r] : g_cards) {
+		if(r.alias || r.name.empty()) continue;
+		std::string n = lower(r.name);
+		if(n == q) return code;
+		if(n.find(q) != std::string::npos) {
+			if(n.size() < bestLen) { bestLen = n.size(); best = code; }
+			near.push_back({n.size(), r.name});
+		}
+	}
+	if(best && near.size() <= 3) return best;   // a short part of one name is fine; a vague one lists the choices
+	if(near.empty()) { err = "no card named \"" + v.get<std::string>() + "\""; return 0; }
+	std::sort(near.begin(), near.end());
+	err = "\"" + v.get<std::string>() + "\" matches " + std::to_string(near.size()) + " cards:";
+	for(size_t i = 0; i < near.size() && i < 5; i++) err += (i ? ", " : " ") + near[i].second;
+	return 0;
+}
+static bool is_extra_type(uint32_t type) { return (type & (TYPE_FUSION | TYPE_SYNCHRO | TYPE_XYZ | TYPE_LINK)) != 0; }
+// "atk" / "def" / "set" / "up" or a POS_* number; set = face-down (Defense for monsters).
+static uint32_t pos_of(const json& v, uint32_t def) {
+	if(v.is_number()) return v.get<uint32_t>();
+	if(!v.is_string()) return def;
+	std::string s = lower(v.get<std::string>());
+	if(s == "atk" || s == "up" || s == "attack") return POS_FACEUP_ATTACK;
+	if(s == "def" || s == "defense") return POS_FACEUP_DEFENSE;
+	if(s == "set" || s == "down") return POS_FACEDOWN_DEFENSE;
+	return def;
+}
+
+// The Lua that builds a layout the way puzzles do (Debug.ReloadFieldBegin / AddCard / ReloadFieldEnd), plus the
+// layout's actions (summons, draws, damage...) as an effect that runs them at the start of the turn player's Main
+// Phase 1, so they happen for real (messages, animations, triggers). Layout:
+//   {"turn":0|1, "players":[{lp, deck[], extra[], hand[], grave[], removed[], mzone[], szone[]} x2], "actions":[...]}
+//   cards are codes or names; mzone / szone entries {card|code, seq (else its index), pos, materials[], counters[],
+//   owner, equippedTo{con,seq}}; null = empty zone. actions: {"do":"summon", player, card, pos, materials[],
+//   "how":"special"|"normal"}, {"do":"draw", player, count}, {"do":"damage"|"recover", player, amount},
+//   {"do":"destroy"|"tograve"|"banish"|"tohand", player, card} (a card that player controls on the field).
+static bool layout_lua(const json& L, std::string& out, std::string& err) {
+	std::ostringstream o;
+	auto code_of = [&](const json& e) -> uint32_t {
+		if(e.is_object()) return resolve_card(e.contains("card") ? e["card"] : e.value("code", json()), err);
+		return resolve_card(e, err);
+	};
+	o << "local M,S,A={},{},{}\n";
+	o << "Debug.ReloadFieldBegin(" << (uint64_t)(DUEL_MODE_MR5 | DUEL_ATTACK_FIRST_TURN) << ",0)\n";
+	const json& pls = L.value("players", json::array());
+	bool emz[2] = {false, false};   // the two Extra Monster Zones are shared: player 0's 5 / 6 are player 1's 6 / 5
+	for(int p = 0; p < 2; p++) {
+		const json pl = p < (int)pls.size() ? pls[p] : json::object();
+		o << "Debug.SetPlayerInfo(" << p << "," << pl.value("lp", 8000) << ",0,1)\n";
+		auto pile = [&](const char* key, int loc, uint32_t pos) -> bool {
+			for(auto& e : pl.value(key, json::array())) {
+				if(e.is_null()) continue;
+				uint32_t c = code_of(e); if(!c) return false;
+				uint32_t ps = e.is_object() ? pos_of(e.value("pos", json()), pos) : pos;
+				o << "Debug.AddCard(" << c << "," << p << "," << p << "," << loc << ",0," << ps << ")\n";
+			}
+			return true;
+		};
+		if(!pile("deck", LOCATION_DECK, POS_FACEDOWN_DEFENSE) || !pile("extra", LOCATION_EXTRA, 0) ||
+		   !pile("hand", LOCATION_HAND, POS_FACEDOWN_DEFENSE) || !pile("grave", LOCATION_GRAVE, POS_FACEUP_ATTACK) ||
+		   !pile("removed", LOCATION_REMOVED, POS_FACEUP_ATTACK)) return false;
+		const json mz = pl.value("mzone", json::array());
+		for(size_t i = 0; i < mz.size(); i++) {
+			const json& e = mz[i];
+			if(e.is_null()) continue;
+			uint32_t c = code_of(e); if(!c) return false;
+			int seq = e.is_object() ? e.value("seq", (int)i) : (int)i;
+			if(seq < 0 || seq > 6) { err = "monster zones are 0-6"; return false; }
+			if(seq >= 5) {
+				int k = p == 0 ? seq - 5 : 6 - seq;
+				if(emz[k]) { err = "both players have a monster in the same Extra Monster Zone"; return false; }
+				emz[k] = true;
+			}
+			uint32_t ps = e.is_object() ? pos_of(e.value("pos", json()), POS_FACEUP_ATTACK) : POS_FACEUP_ATTACK;
+			int owner = e.is_object() ? e.value("owner", p) : p;
+			o << "M[" << p * 10 + seq << "]=Debug.AddCard(" << c << "," << owner << "," << p << "," << LOCATION_MZONE << "," << seq << "," << ps << ",true)\n";
+			if(e.is_object()) {
+				for(auto& m : e.value("materials", json::array())) {
+					uint32_t mc = resolve_card(m, err); if(!mc) return false;
+					o << "Debug.AddCard(" << mc << "," << p << "," << p << "," << LOCATION_MZONE << "," << seq << "," << POS_FACEUP_ATTACK << ")\n";
+				}
+				for(auto& ct : e.value("counters", json::array()))
+					o << "if M[" << p * 10 + seq << "] then Debug.PreAddCounter(M[" << p * 10 + seq << "]," << ct.value("type", 0) << "," << ct.value("count", 0) << ") end\n";
+			}
+		}
+		const json sz = pl.value("szone", json::array());
+		for(size_t i = 0; i < sz.size(); i++) {
+			const json& e = sz[i];
+			if(e.is_null()) continue;
+			uint32_t c = code_of(e); if(!c) return false;
+			int seq = e.is_object() ? e.value("seq", (int)i) : (int)i;
+			uint32_t ps = e.is_object() ? pos_of(e.value("pos", json()), POS_FACEUP_ATTACK) : POS_FACEUP_ATTACK;
+			if(ps == POS_FACEDOWN_DEFENSE) ps = POS_FACEDOWN_ATTACK;   // a Set Spell / Trap
+			int owner = e.is_object() ? e.value("owner", p) : p;
+			o << "S[" << p * 10 + seq << "]=Debug.AddCard(" << c << "," << owner << "," << p << "," << LOCATION_SZONE << "," << seq << "," << ps << ")\n";
+		}
+		for(size_t i = 0; i < sz.size(); i++) {   // equip cards, once every monster is there
+			const json& e = sz[i];
+			if(!e.is_object() || !e.contains("equippedTo")) continue;
+			int seq = e.value("seq", (int)i);
+			const json& t = e["equippedTo"];
+			int k = t.value("con", 0) * 10 + t.value("seq", 0);
+			o << "if S[" << p * 10 + seq << "] and M[" << k << "] then Debug.PreEquip(S[" << p * 10 + seq << "],M[" << k << "]) end\n";
+		}
+	}
+	// cards the actions summon wait in the hand / Extra Deck
+	const json acts = L.value("actions", json::array());
+	std::ostringstream run;
+	for(size_t i = 0; i < acts.size(); i++) {
+		const json& a = acts[i];
+		std::string d = a.value("do", "");
+		int p = a.value("player", 0) & 1;
+		if(d == "summon") {
+			uint32_t c = code_of(a); if(!c) return false;
+			const CardRow& r = g_cards[c];
+			bool ex = is_extra_type(r.type);
+			o << "A[" << i << "]=Debug.AddCard(" << c << "," << p << "," << p << "," << (ex ? LOCATION_EXTRA : LOCATION_HAND) << ",0," << POS_FACEDOWN_DEFENSE << ")\n";
+			uint32_t ps = pos_of(a.value("pos", json()), POS_FACEUP_ATTACK);
+			if(a.value("how", "") == "normal")
+				run << "Duel.Summon(A[" << i << "],true,nil)\n";
+			else {
+				const char* st = (r.type & TYPE_FUSION) ? "SUMMON_TYPE_FUSION" : (r.type & TYPE_SYNCHRO) ? "SUMMON_TYPE_SYNCHRO" :
+					(r.type & TYPE_XYZ) ? "SUMMON_TYPE_XYZ" : (r.type & TYPE_LINK) ? "SUMMON_TYPE_LINK" :
+					((r.type & TYPE_RITUAL) && (r.type & TYPE_MONSTER)) ? "SUMMON_TYPE_RITUAL" : "SUMMON_TYPE_SPECIAL";
+				run << "if Duel.SpecialSummon(A[" << i << "]," << st << "," << p << "," << p << ",true,false," << ps << ")>0 then A[" << i << "]:CompleteProcedure()\n";
+				for(auto& m : a.value("materials", json::array())) {
+					uint32_t mc = resolve_card(m, err); if(!mc) return false;
+					run << " Debug.AddCard(" << mc << "," << p << "," << p << "," << LOCATION_MZONE << ",A[" << i << "]:GetSequence()," << POS_FACEUP_ATTACK << ")\n";
+				}
+				run << "end\n";
+			}
+		} else if(d == "draw") run << "Duel.Draw(" << p << "," << a.value("count", 1) << ",REASON_EFFECT)\n";
+		else if(d == "damage") run << "Duel.Damage(" << p << "," << a.value("amount", 0) << ",REASON_EFFECT)\n";
+		else if(d == "recover") run << "Duel.Recover(" << p << "," << a.value("amount", 0) << ",REASON_EFFECT)\n";
+		else if(d == "destroy" || d == "tograve" || d == "banish" || d == "tohand") {
+			uint32_t c = code_of(a); if(!c) return false;
+			std::string f = d == "destroy" ? "Duel.Destroy(g,REASON_EFFECT)" : d == "tograve" ? "Duel.SendtoGrave(g,REASON_EFFECT)" :
+				d == "banish" ? "Duel.Remove(g,POS_FACEUP,REASON_EFFECT)" : "Duel.SendtoHand(g,nil,REASON_EFFECT)";
+			run << "do local g=Duel.GetMatchingGroup(Card.IsCode," << p << ",LOCATION_ONFIELD,0,nil," << c << "):GetFirst() if g then " << f << " end end\n";
+		} else { err = "unknown action " + d; return false; }
+	}
+	o << "Debug.ReloadFieldEnd()\n";
+	if(!acts.empty()) {
+		int tp = L.value("turn", 0) & 1;
+		o << "local e=Effect.GlobalEffect()\ne:SetType(EFFECT_TYPE_FIELD+EFFECT_TYPE_CONTINUOUS)\ne:SetCode(EVENT_PHASE_START+PHASE_MAIN1)\n"
+		  << "e:SetCondition(function() return Duel.GetTurnPlayer()==" << tp << " end)\n"
+		  << "e:SetOperation(function(e)\ne:Reset()\n" << run.str() << "end)\nDuel.RegisterEffect(e,0)\n";
+	}
+	out = o.str();
+	return true;
+}
+
+// An answer that lets the duel go on without anyone deciding (used to play through turns a layout skips).
+static json default_answer(const json& pr) {
+	std::string t = pr.value("t", "");
+	auto first_n = [](int n) { json a = json::array(); for(int i = 0; i < n; i++) a.push_back(i); return a; };
+	if(t == "select_idlecmd") return {{"act", pr.value("end", 0) ? "end" : "battle"}};
+	if(t == "select_battlecmd") return {{"act", pr.value("end", 0) ? "end" : "main2"}};
+	if(t == "select_effectyn" || t == "select_yesno") return {{"yes", false}};
+	if(t == "select_option" || t == "announce_number") return {{"i", 0}};
+	if(t == "select_chain") return {{"i", pr.value("forced", 0) ? 0 : -1}};
+	if(t == "select_card" || t == "select_tribute") return {{"picks", first_n(std::max(1, pr.value("min", 1)))}};
+	if(t == "select_sum") return {{"picks", first_n((int)pr.value("cards", json::array()).size())}};
+	if(t == "select_unselect_card") return pr.value("finishable", 0) ? json{{"done", true}} : json{{"i", 0}};
+	if(t == "select_place" || t == "select_disfield") {
+		uint32_t flag = pr.value("flag", 0u); int p = pr.value("player", 0);
+		json places = json::array();
+		for(int b = 0; b < 32 && (int)places.size() < std::max(1, pr.value("count", 1)); b++) {
+			if(flag & (1u << b)) continue;
+			int side = b >= 16 ? 1 - p : p, k = b & 15;
+			if(k == 7 || k > 13) continue;
+			places.push_back({{"con", side}, {"loc", k < 8 ? LOCATION_MZONE : LOCATION_SZONE}, {"seq", k < 8 ? k : k - 8}});
+		}
+		return {{"places", places}};
+	}
+	if(t == "select_position") { int ps = pr.value("positions", 1); return {{"pos", ps & -ps}}; }
+	return json::object();
 }
 
 // ------------------------------------------------------------------ output
@@ -332,6 +519,82 @@ struct Duel {
 
 	~Duel() { if(h) OCG_DestroyDuel(h); }
 
+	bool dev = false;     // dev commands allowed (local duels)
+	int ff = -1;          // playing through to this player's turn without showing it (a layout that starts on turn 2)
+	int ffRetries = 0;
+
+	// Starts a duel from a layout (see layout_lua). Decks left out of the layout come from `decks` (shuffled).
+	bool create_layout(json L, const json& decks, std::string& err) {
+		OCG_DuelOptions o{};
+		std::random_device rd; std::mt19937_64 g(((uint64_t)rd() << 32) ^ rd());
+		for(auto& s : o.seed) s = g();
+		o.flags = DUEL_MODE_MR5 | DUEL_ATTACK_FIRST_TURN;
+		o.team1 = {8000, 0, 1}; o.team2 = {8000, 0, 1};
+		o.cardReader = card_reader; o.scriptReader = script_reader; o.logHandler = log_handler; o.cardReaderDone = card_reader_done;
+		if(OCG_CreateDuel(&h, &o) != OCG_DUEL_CREATION_SUCCESS) { h = nullptr; err = "couldn't create the duel"; return false; }
+		for(const char* f : {"constant.lua", "utility.lua"})
+			if(!script_reader(nullptr, h, f)) { err = std::string("missing core script ") + f; return false; }
+		if(!L.contains("players") || !L["players"].is_array()) L["players"] = json::array({json::object(), json::object()});
+		while(L["players"].size() < 2) L["players"].push_back(json::object());
+		for(int p = 0; p < 2; p++) {
+			json& pl = L["players"][p];
+			const json d = decks.is_array() && (int)decks.size() > p ? decks[p] : json::object();
+			if(!pl.contains("deck")) {
+				std::vector<uint32_t> main;
+				for(auto& c : d.value("main", json::array())) main.push_back(c.get<uint32_t>());
+				std::shuffle(main.begin(), main.end(), g);
+				pl["deck"] = main;
+			}
+			if(!pl.contains("extra")) pl["extra"] = d.value("extra", json::array());
+		}
+		std::string src;
+		if(!layout_lua(L, src, err)) return false;
+		if(!OCG_LoadScript(h, src.data(), (uint32_t)src.size(), "layout.lua")) { err = "the layout script failed (see the log)"; return false; }
+		split = L.value("view", std::string("split")) != "all";
+		dev = true;
+		int tp = L.value("turn", 0) & 1;
+		ff = tp == 1 ? 1 : -1;
+		ffRetries = 0;
+		for(int p = 0; p < 2; p++) lp[p] = L["players"][p].value("lp", 8000);
+		OCG_StartDuel(h);
+		return true;
+	}
+
+	// The duel as a layout: every card where it is now (Deck order kept), LP, the turn player.
+	json current_layout() {
+		json s = snapshot(-1);
+		json L = {{"turn", turnPlayer}, {"players", json::array()}};
+		for(int p = 0; p < 2; p++) {
+			const json& sp = s["players"][p];
+			json pl = {{"lp", lp[p]}};
+			json deck = json::array();
+			for(auto& c : query_place(h, (uint8_t)p, LOCATION_DECK)) if(!c.is_null()) deck.push_back(c["code"]);
+			pl["deck"] = deck;
+			for(const char* k : {"hand", "grave", "removed"}) {
+				json a = json::array();
+				for(auto& c : sp[k]) if(!c.is_null()) a.push_back(c["code"]);
+				pl[k] = a;
+			}
+			json ex = json::array();
+			for(auto& c : sp["extra"]) if(!c.is_null()) ex.push_back((c.value("pos", 0) & POS_FACEUP) ? json{{"code", c["code"]}, {"pos", c["pos"]}} : c["code"]);
+			pl["extra"] = ex;
+			for(const char* k : {"mzone", "szone"}) {
+				json a = json::array();
+				for(auto& c : sp[k]) {
+					if(c.is_null()) { a.push_back(nullptr); continue; }
+					json e = {{"code", c["code"]}, {"pos", c["pos"]}, {"owner", c.value("owner", p)}};
+					if(c.contains("materials")) e["materials"] = c["materials"];
+					if(c.contains("counters")) e["counters"] = c["counters"];
+					if(c.contains("equippedTo")) e["equippedTo"] = c["equippedTo"];
+					a.push_back(e);
+				}
+				pl[k] = a;
+			}
+			L["players"].push_back(pl);
+		}
+		return L;
+	}
+
 	bool create(const json& req, std::string& err) {
 		OCG_DuelOptions o{};
 		if(req.contains("seed") && req["seed"].is_array() && req["seed"].size() == 4)
@@ -381,6 +644,22 @@ struct Duel {
 				if(ln >= 1 && o + 4 + ln <= n) {
 					int t = p[o + 4];
 					json m = msg::decode(t, p + o + 5, ln - 1);
+					if(t == MSG_RELOAD_FIELD) { o += 4 + ln; continue; }   // a layout being set up: the states show it
+					if(ff >= 0 && t == MSG_RETRY && ++ffRetries > 20) { ff = -1; fail("couldn't play through to the layout's turn"); }
+					if(ff >= 0 && (msg::is_prompt(t) || t == MSG_RETRY)) {
+						if(t != MSG_RETRY) { prompt = m; prompt["type"] = t; promptType = t; }
+						std::string bytes, err;
+						msg::encode_response(promptType, prompt, default_answer(prompt), bytes, err);
+						OCG_DuelSetResponse(h, bytes.data(), (uint32_t)bytes.size());
+						promptType = 0;
+						o += 4 + ln;
+						continue;
+					}
+					if(ff >= 0) {
+						track(m);
+						if(t == MSG_NEW_TURN && m.value("player", -1) == ff) { ff = -1; send_states(); m["_tracked"] = true; }
+						else { o += 4 + ln; continue; }
+					}
 					if(t == MSG_RETRY) {
 						// The last answer wasn't legal: the core asks the same question again.
 						promptType = prompt.value("type", 0);
@@ -389,7 +668,7 @@ struct Duel {
 					}
 					if(msg::is_prompt(t)) { promptType = t; prompt = m; prompt["type"] = t; send_prompt("prompt"); }
 					else {
-						track(m);
+						if(m.contains("_tracked")) m.erase("_tracked"); else track(m);
 						if(!split) emit({{"ev", "msg"}, {"msg", m}});
 						else for(int v = 0; v < 2; v++) { json f = msg::for_viewer(m, v); if(!f.is_null()) to(v, {{"ev", "msg"}, {"msg", f}}); }
 						if(t == MSG_WIN) { over = true; promptType = 0; send_states(); emit({{"ev", "end"}, {"winner", m.value("player", 2)}, {"reason", m.value("reason", 0)}}); return; }
@@ -437,7 +716,10 @@ int main(int argc, char** argv) {
 			if(!ready) { fail("init first"); continue; }
 			duel = std::make_unique<Duel>();
 			std::string err;
-			if(!duel->create(req, err)) { fail(err); duel.reset(); continue; }
+			bool ok = req.contains("setup") ? duel->create_layout(req["setup"], req.value("players", json::array()), err) : duel->create(req, err);
+			if(ok && req.value("dev", false)) duel->dev = true;
+			if(ok && req.contains("setup")) duel->split = req.value("view", std::string("split")) != "all";
+			if(!ok) { fail(err); duel.reset(); continue; }
 			emit({{"ev", "started"}, {"id", id}});
 			duel->send_states();   // the starting board (decks placed, empty hands) before the opening draws
 			duel->pump();
@@ -470,6 +752,84 @@ int main(int argc, char** argv) {
 			json out = json::array();
 			for(size_t i = 0; i < hits.size() && i < limit; i++) out.push_back(card_json(hits[i].second, g_cards[hits[i].second]));
 			emit({{"ev", "search"}, {"id", id}, {"cards", out}});
+		} else if(cmd == "dev") {
+			// Test tools (local duels started with "dev":true): change the duel and start it again from the result.
+			if(!duel || !duel->dev) { fail("dev commands are off in this duel"); continue; }
+			std::string err, op = req.value("op", "");
+			json L = op == "load" ? req.value("setup", json::object()) : duel->current_layout();
+			if(op == "load") {   // a saved layout; decks it leaves out stay as they are now
+				json cur = duel->current_layout();
+				if(!L.contains("players")) L["players"] = json::array({json::object(), json::object()});
+				for(int p = 0; p < 2 && p < (int)L["players"].size(); p++)
+					for(const char* k : {"deck", "extra"}) if(!L["players"][p].contains(k)) L["players"][p][k] = cur["players"][p][k];
+			}
+			int p = req.value("player", 0) & 1;
+			if(req.contains("turn")) L["turn"] = req["turn"].get<int>() & 1;
+			json& pl = L["players"][p];
+			auto first_free = [](json& zone, int lo, int hi) { for(int i = lo; i <= hi; i++) { while((int)zone.size() <= i) zone.push_back(nullptr); if(zone[i].is_null()) return i; } return -1; };
+			if(op == "spawn") {
+				uint32_t c = resolve_card(req.value("card", json()), err);
+				if(!c) { emit({{"ev", "dev"}, {"ok", false}, {"error", err}}); continue; }
+				std::string to = req.value("to", std::string("hand"));
+				if(to == "hand" || to == "grave" || to == "removed" || to == "deck" || to == "extra") {
+					if(!pl.contains(to)) pl[to] = json::array();
+					pl[to].push_back(c);
+				} else if(to == "mzone" || to == "szone" || to == "field" || to == "emz") {
+					json& zone = pl[to == "mzone" || to == "emz" ? "mzone" : "szone"];
+					if(!zone.is_array()) zone = json::array();
+					int seq = req.contains("seq") ? req["seq"].get<int>() : to == "field" ? 5 : to == "emz" ? first_free(zone, 5, 6) : first_free(zone, 0, 4);
+					if(to == "emz" && seq >= 5) {   // the other player's monster may already be in that one (shared zones)
+						json& oz = L["players"][1 - p]["mzone"];
+						auto taken = [&](int s) { int os = 11 - s; return oz.is_array() && (int)oz.size() > os && !oz[os].is_null(); };
+						if(taken(seq)) seq = (seq == 5 && !taken(6) && (zone.size() <= 6 || zone[6].is_null())) ? 6 : -1;
+					}
+					if(seq < 0) { emit({{"ev", "dev"}, {"ok", false}, {"error", "no free zone"}}); continue; }
+					while((int)zone.size() <= seq) zone.push_back(nullptr);
+					json e = {{"code", c}, {"pos", pos_of(req.value("pos", json()), to == "szone" || to == "field" ? POS_FACEUP_ATTACK : POS_FACEUP_ATTACK)}};
+					if(req.contains("materials")) e["materials"] = req["materials"];
+					zone[seq] = e;
+				} else { emit({{"ev", "dev"}, {"ok", false}, {"error", "unknown place " + to}}); continue; }
+			} else if(op == "act") {   // summon / draw / damage / recover / destroy... (played for real)
+				json a = req.value("action", json::object());
+				a["player"] = p;
+				L["actions"] = json::array({a});
+				if(!req.contains("turn")) L["turn"] = duel->turnPlayer;
+			} else if(op == "lp") pl["lp"] = req.value("value", 8000);
+			else if(op == "remove") {
+				uint32_t c = resolve_card(req.value("card", json()), err);
+				if(!c) { emit({{"ev", "dev"}, {"ok", false}, {"error", err}}); continue; }
+				bool gone = false;
+				for(const char* k : {"mzone", "szone", "hand", "grave", "removed", "extra", "deck"}) {
+					json& a = pl[k];
+					for(size_t i = 0; i < a.size() && !gone; i++) {
+						const json& e = a[i];
+						uint32_t ec = e.is_object() ? e.value("code", 0u) : (e.is_number() ? e.get<uint32_t>() : 0u);
+						if(ec != c) continue;
+						if(std::string(k) == "mzone" || std::string(k) == "szone") a[i] = nullptr; else a.erase(a.begin() + i);
+						gone = true;
+					}
+					if(gone) break;
+				}
+				if(!gone) { emit({{"ev", "dev"}, {"ok", false}, {"error", "that card isn't there"}}); continue; }
+			} else if(op == "clear") {
+				for(int q = 0; q < 2; q++) {
+					if(req.contains("player") && q != p) continue;
+					json& x = L["players"][q];
+					for(const char* k : {"mzone", "szone"}) {
+						for(auto& e : x[k]) if(!e.is_null()) { x["grave"].push_back(e["code"]); for(auto& m : e.value("materials", json::array())) x["grave"].push_back(m); }
+						x[k] = json::array();
+					}
+				}
+			} else if(op != "load" && op != "turn") { emit({{"ev", "dev"}, {"ok", false}, {"error", "unknown op " + op}}); continue; }
+			json decks = json::array();
+			auto next = std::make_unique<Duel>();
+			if(!next->create_layout(L, decks, err)) { emit({{"ev", "dev"}, {"ok", false}, {"error", err}}); continue; }
+			next->split = duel->split;
+			duel = std::move(next);
+			emit({{"ev", "reset"}});
+			emit({{"ev", "dev"}, {"ok", true}, {"op", op}});
+			duel->send_states();
+			duel->pump();
 		} else if(cmd == "resync") {
 			if(!duel) { fail("no duel running"); continue; }
 			duel->resync(req.value("player", 0));
